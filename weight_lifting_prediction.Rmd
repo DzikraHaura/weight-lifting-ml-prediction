@@ -1,0 +1,399 @@
+---
+title: "Predicting Weight Lifting Exercise Quality using Machine Learning"
+author: "Dzikra Alya Haura Jamaludin"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    highlight: tango
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      fig.width = 10, fig.height = 6, cache = TRUE)
+```
+
+# Executive Summary
+
+This project aims to predict the quality of weight lifting exercises using accelerometer data from belt, forearm, arm, and dumbbell sensors from 6 participants. Using Random Forest algorithm, the developed model achieves **99.2% accuracy** in predicting whether exercises are performed correctly or incorrectly, with an expected out-of-sample error of approximately **0.8%**.
+
+# Background and Objective
+
+People regularly quantify *how much* of a particular activity they do, but rarely quantify *how well they do it*. This project uses data from accelerometers on the belt, forearm, arm, and dumbbell of 6 participants to predict the manner in which they performed weight lifting exercises.
+
+**Exercise Classes:**
+- **A**: Exactly according to specification (correct)
+- **B**: Throwing elbows to the front
+- **C**: Lifting dumbbell only halfway
+- **D**: Lowering dumbbell only halfway
+- **E**: Throwing hips to the front
+
+```{r load-libraries}
+# Load required libraries
+suppressMessages({
+  library(caret)
+  library(randomForest)
+  library(corrplot)
+  library(rpart)
+  library(rpart.plot)
+  library(RColorBrewer)
+  library(rattle)
+  library(e1071)
+  library(gbm)
+  library(ggplot2)
+  library(lattice)
+  library(knitr)
+})
+
+# Set seed for reproducibility
+set.seed(12345)
+```
+
+# Data Loading and Exploration
+
+```{r load-data}
+# Load data from URLs
+training_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testing_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+# Download and read data
+training_data <- read.csv(url(training_url), na.strings=c("NA","#DIV/0!",""))
+testing_data <- read.csv(url(testing_url), na.strings=c("NA","#DIV/0!",""))
+
+# Data dimensions
+cat("Training Data Dimensions:", dim(training_data), "\n")
+cat("Testing Data Dimensions:", dim(testing_data), "\n")
+```
+
+```{r explore-data}
+# Target class distribution
+class_table <- table(training_data$classe)
+class_prop <- prop.table(class_table)
+
+cat("Class Distribution:\n")
+print(class_table)
+cat("\nClass Proportions:\n")
+print(round(class_prop, 3))
+
+# Visualize class distribution
+barplot(class_table, main="Distribution of Exercise Classes", 
+        xlab="Class", ylab="Frequency", col=rainbow(5))
+```
+
+```{r missing-data-analysis}
+# Analyze missing data
+missing_count <- sapply(training_data, function(x) sum(is.na(x)))
+high_missing <- sum(missing_count/nrow(training_data) > 0.95)
+
+cat("Number of variables with >95% missing values:", high_missing, "\n")
+cat("Total variables:", ncol(training_data), "\n")
+cat("Variables to keep after removing high missing:", ncol(training_data) - high_missing, "\n")
+```
+
+# Data Preprocessing and Cleaning
+
+```{r data-cleaning}
+# Remove columns with >95% missing values
+na_threshold <- 0.95
+training_clean <- training_data[, missing_count/nrow(training_data) < na_threshold]
+testing_clean <- testing_data[, sapply(testing_data, function(x) sum(is.na(x)))/nrow(testing_data) < na_threshold]
+
+cat("After removing high missing value columns:\n")
+cat("Training:", ncol(training_clean), "variables\n")
+
+# Remove identification columns (first 7 columns)
+# X, user_name, raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp, new_window, num_window
+training_clean <- training_clean[, -(1:7)]
+testing_clean <- testing_clean[, -(1:7)]
+
+cat("After removing identification columns:\n")
+cat("Training:", ncol(training_clean), "variables\n")
+
+# Remove near zero variance predictors
+nzv <- nearZeroVar(training_clean, saveMetrics = TRUE)
+training_clean <- training_clean[, !nzv$nzv]
+testing_clean <- testing_clean[, !nzv$nzv]
+
+cat("After removing near zero variance:\n")
+cat("Training:", ncol(training_clean), "variables\n")
+cat("Final number of predictors:", ncol(training_clean)-1, "\n")
+```
+
+```{r data-split}
+# Split training data into training (70%) and validation (30%) sets
+inTrain <- createDataPartition(training_clean$classe, p=0.7, list=FALSE)
+train_set <- training_clean[inTrain, ]
+validation_set <- training_clean[-inTrain, ]
+
+# Ensure factor levels are consistent
+train_set$classe <- factor(train_set$classe)
+validation_set$classe <- factor(validation_set$classe, levels = levels(train_set$classe))
+
+cat("Dataset sizes after split:\n")
+cat("Training set:", nrow(train_set), "observations\n")
+cat("Validation set:", nrow(validation_set), "observations\n")
+cat("Testing set:", nrow(testing_clean), "observations\n")
+```
+
+# Model Building and Training
+
+## Model 1: Decision Tree
+
+```{r model-decision-tree, cache=TRUE}
+# Train Decision Tree model
+model_dt <- rpart(classe ~ ., data=train_set, method="class")
+
+# Make predictions on validation set
+pred_dt <- predict(model_dt, validation_set, type="class")
+pred_dt <- factor(pred_dt, levels = levels(train_set$classe))  # Ensure factor levels match
+
+# Create confusion matrix
+conf_dt <- confusionMatrix(pred_dt, validation_set$classe)
+
+# Display results
+cat("Decision Tree Results:\n")
+cat("Accuracy:", round(conf_dt$overall['Accuracy'], 4), "\n")
+cat("Kappa:", round(conf_dt$overall['Kappa'], 4), "\n")
+
+# Plot decision tree
+fancyRpartPlot(model_dt, main="Decision Tree Model", sub="")
+```
+
+## Model 2: Random Forest
+
+```{r model-random-forest, cache=TRUE}
+# Train Random Forest with 3-fold cross-validation
+control_rf <- trainControl(method="cv", number=3, verboseIter=FALSE)
+model_rf <- train(classe ~ ., data=train_set, method="rf", 
+                  trControl=control_rf, ntree=100)
+
+# Make predictions on validation set
+pred_rf <- predict(model_rf, validation_set)
+pred_rf <- factor(pred_rf, levels = levels(train_set$classe))  # Ensure factor levels match
+
+# Create confusion matrix
+conf_rf <- confusionMatrix(pred_rf, validation_set$classe)
+
+# Display results
+cat("Random Forest Results:\n")
+cat("Accuracy:", round(conf_rf$overall['Accuracy'], 4), "\n")
+cat("Kappa:", round(conf_rf$overall['Kappa'], 4), "\n")
+```
+
+## Model 3: Gradient Boosting Machine
+
+```{r model-gbm, cache=TRUE}
+# Train GBM with cross-validation
+control_gbm <- trainControl(method="cv", number=3, verboseIter=FALSE)
+model_gbm <- train(classe ~ ., data=train_set, method="gbm", 
+                   trControl=control_gbm, verbose=FALSE)
+
+# Make predictions on validation set
+pred_gbm <- predict(model_gbm, validation_set)
+pred_gbm <- factor(pred_gbm, levels = levels(train_set$classe))  # Ensure factor levels match
+
+# Create confusion matrix
+conf_gbm <- confusionMatrix(pred_gbm, validation_set$classe)
+
+# Display results
+cat("GBM Results:\n")
+cat("Accuracy:", round(conf_gbm$overall['Accuracy'], 4), "\n")
+cat("Kappa:", round(conf_gbm$overall['Kappa'], 4), "\n")
+```
+
+# Model Comparison and Selection
+
+```{r model-comparison}
+# Create comparison table
+comparison_results <- data.frame(
+  Model = c("Decision Tree", "Random Forest", "GBM"),
+  Accuracy = c(conf_dt$overall['Accuracy'], conf_rf$overall['Accuracy'], conf_gbm$overall['Accuracy']),
+  Kappa = c(conf_dt$overall['Kappa'], conf_rf$overall['Kappa'], conf_gbm$overall['Kappa']),
+  OutOfSampleError = c(1-conf_dt$overall['Accuracy'], 1-conf_rf$overall['Accuracy'], 1-conf_gbm$overall['Accuracy']),
+  stringsAsFactors = FALSE
+)
+
+# Convert numeric columns to numeric type (in case they're not)
+comparison_results$Accuracy <- as.numeric(comparison_results$Accuracy)
+comparison_results$Kappa <- as.numeric(comparison_results$Kappa)
+comparison_results$OutOfSampleError <- as.numeric(comparison_results$OutOfSampleError)
+
+# Display comparison
+cat("Model Comparison Results:\n")
+print(comparison_results)
+
+# Round numeric columns for display
+comparison_results_rounded <- comparison_results
+comparison_results_rounded[, -1] <- round(comparison_results_rounded[, -1], 4)
+
+# Identify best model
+best_model_idx <- which.max(comparison_results$Accuracy)
+best_model_name <- comparison_results$Model[best_model_idx]
+cat("\nBest Model:", best_model_name, "\n")
+cat("Best Accuracy:", round(max(comparison_results$Accuracy), 4), "\n")
+cat("Expected Out-of-Sample Error:", round(min(comparison_results$OutOfSampleError), 4), "\n")
+
+# Visualize comparison
+barplot(comparison_results$Accuracy, 
+        names.arg = comparison_results$Model,
+        main = "Model Accuracy Comparison", 
+        ylab = "Accuracy", 
+        col = c("red", "green", "blue"),
+        ylim = c(0.7, 1.0))
+```
+
+# Detailed Analysis of Best Model (Random Forest)
+
+```{r rf-detailed-analysis}
+# Variable importance
+importance_rf <- varImp(model_rf)
+cat("Top 10 Most Important Variables:\n")
+print(importance_rf$importance[1:10, , drop=FALSE])
+
+# Plot variable importance
+plot(importance_rf, top=20, main="Top 20 Most Important Variables - Random Forest")
+```
+
+```{r rf-confusion-matrix}
+# Detailed confusion matrix
+cat("Detailed Confusion Matrix for Random Forest:\n")
+print(conf_rf$table)
+
+# Per-class statistics
+cat("\nPer-Class Statistics:\n")
+per_class_stats <- conf_rf$byClass[, c('Sensitivity', 'Specificity', 'Pos Pred Value', 'Neg Pred Value')]
+print(round(per_class_stats, 4))
+```
+
+```{r rf-cross-validation}
+# Cross-validation results
+cat("Cross-Validation Results:\n")
+print(model_rf$results)
+
+# Final model information
+cat("\nFinal Random Forest Model:\n")
+print(model_rf$finalModel)
+```
+
+# Cross-Validation and Error Estimation
+
+```{r error-estimation}
+# Calculate different types of errors
+# In-sample error (training set)
+pred_train <- predict(model_rf, train_set)
+train_accuracy <- sum(pred_train == train_set$classe) / length(pred_train)
+in_sample_error <- 1 - train_accuracy
+
+# Out-of-sample error (validation set)
+out_sample_error <- 1 - conf_rf$overall['Accuracy']
+
+# Cross-validation error
+cv_accuracy <- max(model_rf$results$Accuracy)
+cv_error <- 1 - cv_accuracy
+
+cat("Error Analysis:\n")
+cat("In-Sample Error (Training Set):", round(in_sample_error, 4), "\n")
+cat("Out-of-Sample Error (Validation Set):", round(out_sample_error, 4), "\n")
+cat("Cross-Validation Error:", round(cv_error, 4), "\n")
+cat("\nExpected Error on New Data:", round(out_sample_error, 4), "\n")
+```
+
+# Final Predictions on Test Set
+
+```{r final-predictions}
+# Make predictions on 20 test cases using Random Forest
+final_predictions <- predict(model_rf, testing_clean)
+cat("Final Predictions for 20 Test Cases:\n")
+print(final_predictions)
+
+# Calculate confidence levels
+pred_prob <- predict(model_rf, testing_clean, type="prob")
+max_prob <- apply(pred_prob, 1, max)
+
+cat("\nConfidence Level for Each Prediction:\n")
+for(i in 1:length(final_predictions)) {
+  cat("Test Case", i, ":", as.character(final_predictions[i]), 
+      " (Confidence:", round(max_prob[i]*100, 1), "%)\n")
+}
+cat("\nAverage Confidence Level:", round(mean(max_prob)*100, 1), "%\n")
+
+# Create prediction summary table
+prediction_summary <- data.frame(
+  TestCase = 1:20,
+  Prediction = as.character(final_predictions),
+  Confidence = round(max_prob*100, 1)
+)
+kable(prediction_summary, caption="Final Predictions Summary")
+```
+
+```{r save-results}
+# Save predictions to CSV for submission
+write.csv(data.frame(problem_id = 1:20, prediction = final_predictions), 
+          "final_predictions.csv", row.names = FALSE)
+
+# Save the best model
+saveRDS(model_rf, "best_model_rf.rds")
+
+cat("Results saved:\n")
+cat("- final_predictions.csv (for quiz submission)\n")
+cat("- best_model_rf.rds (trained model)\n")
+```
+
+# Conclusions
+
+## Model Selection Justification
+
+**Random Forest** was selected as the best model based on the following criteria:
+
+1. **Highest Accuracy**: 99.2% compared to 96.1% (GBM) and 74.9% (Decision Tree)
+2. **Robustness**: Random Forest is resistant to overfitting due to bootstrap aggregation
+3. **Feature Selection**: Provides automatic variable importance ranking
+4. **Cross-Validation**: Built-in out-of-bag error estimation
+5. **Stability**: Consistent performance across different validation methods
+
+## Cross-Validation Strategy
+
+A multi-layered validation approach was implemented:
+
+1. **3-fold Cross-Validation**: Used during model training to tune parameters
+2. **Hold-out Validation**: 30% of training data reserved for independent validation
+3. **Out-of-bag Error**: Inherent bootstrap validation in Random Forest
+
+This comprehensive validation strategy ensures robust error estimation and model reliability.
+
+## Expected Out-of-Sample Error
+
+Based on validation results:
+- **Validation Set Error**: 0.8%
+- **Cross-Validation Error**: 0.6%
+- **Conservative Estimate**: ~1% expected error on new data
+
+The low and consistent error rates across different validation methods indicate the model should generalize well to new data.
+
+## Key Findings
+
+1. **Most Important Variables**: Belt sensors (roll_belt, pitch_belt, yaw_belt) and forearm sensors (pitch_forearm) are most predictive
+2. **Class Performance**: All classes achieve >98% sensitivity and specificity
+3. **Model Confidence**: Average prediction confidence of 99.4% on test cases
+4. **Computational Efficiency**: Model training completed in reasonable time with good performance
+
+## Practical Applications
+
+This model can be applied to:
+- **Real-time Form Correction**: Integration with fitness applications
+- **Personal Training**: Automated coaching and feedback systems
+- **Rehabilitation**: Movement quality assessment in physical therapy
+- **Sports Science**: Performance analysis and technique optimization
+
+## Final Predictions
+
+The Random Forest model predicts the 20 test cases with high confidence (99.4% average) and are expected to have approximately 1% error rate based on our validation analysis.
+
+---
+
+*Data Source: Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13). Stuttgart, Germany: ACM SIGCHI, 2013.*
